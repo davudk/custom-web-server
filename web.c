@@ -37,7 +37,7 @@ int main(int argc, char *argv[]) {
 
         const int BUFFER_SIZE = 70000;
         char buffer[BUFFER_SIZE];
-        int count;
+        int size, readlen;
         
         char* template = "HTTP/1.0 200 OK\r\n"
             "Date: Sun, 04 Feb 2018 13:25:32 GMT\r\n"
@@ -49,15 +49,14 @@ int main(int argc, char *argv[]) {
             "<!doctype html><html><body><pre>\r\n";
         send(client_fd, template, strlen(template), 0);
 
-        while (count = recv(client_fd, buffer, BUFFER_SIZE, 0)) {
-            if (count < 0) {
-                printf("count < 0..");
+        while (readlen = recv(client_fd, buffer + size, BUFFER_SIZE, 0)) {
+            if (readlen < 0) {
+                printf("readlen < 0..");
                 return -1;
             }
 
-            printf("%s", buffer);
-
-            send(client_fd, buffer, count, 0);
+            send(client_fd, buffer + size, readlen, 0);
+            size += readlen;
 
             // if (count > 65535) { // max limit for HTTP req
             //     break;
@@ -67,6 +66,8 @@ int main(int argc, char *argv[]) {
         
         char* end = "</pre></body></html>";
         send(client_fd, end, strlen(end), 0);
+
+        printf("%s", buffer);
 
         close(client_fd);
     }
