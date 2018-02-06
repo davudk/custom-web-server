@@ -1,10 +1,19 @@
-#include <netdb.h> // used specifically for: struct sockaddr_in
+#include <ctype.h>
+#include <fcntl.h>
+#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
+#include <strings.h>
 #include <sys/socket.h>
-#include <unistd.h> // close(...);
+#include <time.h>
+#include <unistd.h>
+
+#define BUFFER_SIZE 65535
+#define TIMEOUT_SECS 30
+#define CLIENTS_MAX 31 // max 32 fd's (32=31+1) ; 1 is server socket fd
+#define BOLD "\x1B[1m"
+#define UNBOLD "\x1B[0m"
 
 struct request_line {
     char * method, * requestUri, * httpVersion;
@@ -17,10 +26,20 @@ struct http_request_header {
     struct request_line * reqline;
     struct key_value * fields;
 };
+struct client_connection {
+    int client_fd;
+    char buffer[BUFFER_SIZE + 1];
+    ssize_t size, expectedsize;
+    struct sockaddr addr;
+    time_t lastReceived;
+    struct http_request_header * header;
+};
+
+struct client_connection * clients[CLIENTS_MAX];
 
 void tryOrDie(int iserror, const char * errorOutput);
 int initServer(unsigned short port);
-char handleClient(int client_fd, struct sockaddr clientAddr);
+char handleClient(struct client_connection * c);
 struct http_request_header * doParse(const char * s);
 struct key_value * getField(struct http_request_header * reqheader, const char * fieldName);
 char iscrlf(const char * s);
@@ -28,20 +47,46 @@ void freeHttpReqHeader(struct http_request_header * reqheader);
 
 int main(int argc, char * argv[]) {
     unsigned short port = 13370;
-    if (argc > 1) port = atoi(argv[1]);
-    else printf("no port was specified, using default port of %d\n", port);
+    if (argc > 1) tryOrDie((port = atoi(argv[1])) == 0, "Invalid port.\n");
+    else printf("No port was specified... using default port: %d\n", port);
 
     int socket_fd = initServer(port);
+    fcntl(socket_fd, F_SETFL, O_NONBLOCK);
+    printf("Started server on port %d (socket fd: %d)...\n", port, socket_fd);
     while (1) {
-        struct sockaddr clientAddr;
-        socklen_t len = sizeof(clientAddr);
+        struct sockaddr clientAddr; socklen_t len = sizeof(clientAddr);
         int client_fd = accept(socket_fd, &clientAddr, &len);
-        // int client_fd = accept(socket_fd, NULL, NULL);
+        if (client_fd >= 0) {
+            fcntl(client_fd, F_SETFL, O_NONBLOCK);
 
-        while (handleClient(client_fd, clientAddr) == 0);
+            char found = 0;
+            for (int i = 0; i < CLIENTS_MAX; i++) {
+                if (clients[i]) continue;
+                clients[i] = malloc(sizeof(struct client_connection));
+                memset(clients[i], 0, sizeof(struct client_connection));
+                clients[i]->client_fd = client_fd;
+                clients[i]->addr = clientAddr;
+                clients[i]->lastReceived = time(NULL);
+                found = 1; break;
+            }
+            if (found) printf(BOLD "A new connection has been accepted (fd: %d)\n" UNBOLD, client_fd);
+            else close(client_fd), printf(BOLD "Connection rejected due to FD limit (32 max)\n" UNBOLD);
+        }
+
+        for (int i = 0; i < CLIENTS_MAX; i++) {
+            if (!clients[i]) continue;
+            if (handleClient(clients[i])) {
+                printf(BOLD "Connection closed (fd: %d)\n" UNBOLD, clients[i]->client_fd);
+                close(clients[i]->client_fd);
+                if (clients[i]->header) freeHttpReqHeader(clients[i]->header);
+                free(clients[i]); clients[i] = NULL;
+            }
+        }
+
+        struct timespec duration = { .tv_sec = 0, .tv_nsec = 1000000000L / 10 };
+        nanosleep(&duration, NULL);
     }
-
-    close(socket_fd);
+    // close(socket_fd); // never occurs anyways
 }
 
 void tryOrDie(int iserror, const char * errorOutput) {
@@ -52,8 +97,7 @@ int initServer(unsigned short port) {
     int type = SOCK_STREAM; // TCP
     int protocol = 0; // default
     int socket_fd = socket(domain, type, protocol);
-    tryOrDie(socket_fd < 0, "failed to create socket\n");
-    printf("created socket (fd: %d)\n", socket_fd);
+    tryOrDie(socket_fd < 0, "Failed to create socket...\n");
     
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -63,79 +107,72 @@ int initServer(unsigned short port) {
     addr.sin_addr.s_addr = htonl(INADDR_ANY); // any local IP
     //addr.sin_addr.s_addr = inet_addr("127.0.0.1"); // localhost
     int status = bind(socket_fd, (struct sockaddr *)&addr, sizeof(addr));
-    tryOrDie(status < 0, "failed to bind socket\n");
-    printf("binded socket\n");
+    tryOrDie(status < 0, "Failed to bind socket...\n");
 
     int queueLimit = 10;
     status = listen(socket_fd, queueLimit);
-    tryOrDie(status < 0, "failed to listen on port\n");
-    printf("listening on port %d\n\n", port);
+    tryOrDie(status < 0, "Failed to listen on port...\n");
 
     return socket_fd;
 }
-char handleClient(int client_fd, struct sockaddr clientAddr) {
-    const int BUFFER_SIZE = 65535; int size = 0, readlen = 0, expectedLength = 0;
-    char buffer[BUFFER_SIZE]; struct http_request_header * reqheader = NULL;
+char handleClient(struct client_connection * c) {
+    ssize_t count = recv(c->client_fd, c->buffer + c->size, BUFFER_SIZE, 0);
+    if (count <= 0) {
+        if (difftime(time(NULL) /* now */, c->lastReceived) > TIMEOUT_SECS) {
+            printf(BOLD "A client has timed out (fd: %d)\n" UNBOLD, c->client_fd);
+            return 1;
+        } else return 0;
+    }
+    c->size += count;
+    c->lastReceived = time(NULL);
 
-    while (expectedLength == 0 || size < expectedLength) {
-        readlen = recv(client_fd, buffer + size, BUFFER_SIZE, 0);
-        if (readlen <= 0) {
-            printf("HEY GOT %d READLEN", readlen);
-            exit(0);
+    if (c->header == NULL) {
+        size_t contentIndex = 0;
+        for (int i = 0; i + 3 < c->size; i++)
+            if (iscrlf(c->buffer + i) && iscrlf(c->buffer + i + 2)) 
+                { contentIndex = i + 4; break; }
+        if (contentIndex && (c->header = doParse(c->buffer))) {
+            struct key_value * contentLength = getField(c->header, "Content-Length");
+            if (contentLength)  {
+                c->expectedsize = contentIndex + atoi(contentLength->value) /* content-length*/;
+                if (c->expectedsize > BUFFER_SIZE) return 1; // maximum allowed length
+            } else c->expectedsize = c->size;
         }
-        size += readlen;
-
-        if (reqheader == NULL)
-        for (int i = 0; i + 3 < size; i++)
-        if (iscrlf(buffer + i) && iscrlf(buffer + i + 2)) {
-            reqheader = doParse(buffer);
-
-            struct key_value * contentLength = getField(reqheader, "Content-Length");
-            if (contentLength != NULL)  {
-                int clen = atoi(contentLength->value);
-                expectedLength = i + 4 + clen;
-                if (expectedLength > 65535) { // maximum allowed length
-                    close(client_fd); return 1;
-                }
-            } else expectedLength = size;
-        }
-
-
     }
 
-    printf("%s", buffer);
+    if (c->size == c->expectedsize) {
+        c->buffer[c->expectedsize + 1] = 0;
+        printf("%s", c->buffer);
 
-    const char * bodyTemplate =
-        "<!doctype html><html><body>"
-            "<pre>%s</pre>"
-            "<pre style='color: red; padding-left: 1em;'>%s</pre>"
-            "<style>pre { margin: 0; }</style>"
-        "</body></html>";
-    char * body = malloc(10000);
+        const char * contentTemplate =
+            "<!doctype html><html><body>"
+                "<pre>%s</pre><pre style='color: red; padding-left: 1em;'>%s</pre>"
+                "<style>pre { margin: 0; }</style>"
+            "</body></html>";
+        char * content = malloc(10240);
+        sprintf(content, contentTemplate, c->buffer, "SOME MORE TEXT HERE SOON");
 
-    sprintf(body, bodyTemplate, buffer, "SOME MORE TEXT HERE SOON");
+        const char * responseTemplate = "HTTP/1.1 200 OK\r\n"
+            "Content-Length: %d\r\n\r\n%s";
+        char * response = malloc(10000);
+        sprintf(response, responseTemplate, strlen(content), content);
 
-    const char * responseTemplate = "HTTP/1.1 200 OK\r\n"
-        "Content-Length: %d\r\n\r\n%s";
-    char * response = malloc(10000);
-    sprintf(response, responseTemplate, strlen(body), body);
+        send(c->client_fd, response, strlen(response), 0); free(content); free(response);
+        memset(c->buffer, 0, BUFFER_SIZE); c->size = c->expectedsize = 0;
 
-    send(client_fd, response, strlen(response), 0);
-
-    
-    char closeConnection = 1;
-    struct key_value * connection = getField(reqheader, "Connection");
-    if (connection != NULL && strcmp(connection->value, "keep-alive") == 0) {
-        closeConnection = 0;
+        struct key_value * connection = getField(c->header, "Connection");
+        char keepalive = strcasecmp(c->header->reqline->httpVersion, "HTTP/1.1") == 0 || // HTTP/1.1 keep alive by default
+            (connection && strcasecmp(connection->value, "keep-alive") == 0);
+        
+        c->header = NULL;
+        return !keepalive;
     }
 
-    freeHttpReqHeader(reqheader);
-    if (closeConnection) close(client_fd);
-    return closeConnection;
+    return 0; // keep alive until all data is received
 }
 struct key_value * getField(struct http_request_header * reqheader, const char * fieldName) {
     for (struct key_value * f = reqheader->fields; f; f = f->next) {
-        if (strcmp(f->key, fieldName) == 0) return f;
+        if (strcasecmp(f->key, fieldName) == 0) return f;
     } return NULL;
 }
 char iscrlf(const char * s) { return s[0] == '\r' && s[1] == '\n'; }
