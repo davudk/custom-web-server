@@ -33,7 +33,6 @@ struct client_connection {
     int client_fd;
     char buffer[BUFFER_SIZE + 1];
     ssize_t size, expectedsize;
-    struct sockaddr addr;
     time_t lastReceived;
     struct http_request_header * header;
 };
