@@ -7,4 +7,4 @@ This program demonstrates the usage of the C Posix library to achieve web commun
 
 Upto 31 simultaneous connections are allowed. Connections can be kept alive with `Connection: keep-alive` or by default default if using HTTP version 1.1.
 
-**Note:** I've tried not to stray too far from the specification: [RFC2616](https://tools.ietf.org/html/rfc2616).
+Find there specification [here](https://tools.ietf.org/html/rfc2616). (RFC2616)
