@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <stdio.h>
@@ -10,7 +11,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#define BUFFER_SIZE 65535
+#define QUEUE_SIZE 10
+#define MESSAGE_MAX_SIZE 65535
+#define BUFFER_SIZE 65536
 #define TIMEOUT_SECS 30
 #define CLIENTS_MAX 31 // max 32 fd's (32=31+1) ; 1 is server socket fd
 
@@ -24,7 +27,7 @@ struct http_request_header {
 };
 struct client_connection {
     int client_fd;
-    char buffer[BUFFER_SIZE + 1];
+    char buffer[BUFFER_SIZE];
     ssize_t size, expectedsize;
     time_t lastReceived;
     struct http_request_header *header;
@@ -33,7 +36,7 @@ struct client_connection {
 struct client_connection *clients[CLIENTS_MAX];
 char contentBuffer[70000], responseBuffer[80000];
 
-void tryOrDie(int iserror, const char *errorOutput);
+void tryOrDie(int iserror, const char *text);
 int initServer(unsigned short port);
 char handleClient(struct client_connection *c);
 struct key_value *getField(struct http_request_header *reqheader, const char *fieldName);
@@ -45,7 +48,7 @@ char *doLookup(const char *host, const char *port);
 
 int main(int argc, char *argv[]) {
     unsigned short port = 1337;
-    if (argc > 1) tryOrDie((port = atoi(argv[1])) == 0, "Invalid port.\n");
+    if (argc == 2 && isdigit(*argv[1])) port = atoi(argv[1]);
     else printf("usage: %s port\n", argv[0]), exit(EXIT_FAILURE);
 
     int socket_fd = initServer(port);
@@ -57,8 +60,7 @@ int main(int argc, char *argv[]) {
             fcntl(client_fd, F_SETFL, O_NONBLOCK);
             for (i = 0; i < CLIENTS_MAX; i++) {
                 if (clients[i]) continue;
-                clients[i] = malloc(sizeof(struct client_connection));
-                memset(clients[i], 0, sizeof(struct client_connection));
+                clients[i] = calloc(1, sizeof(struct client_connection));
                 clients[i]->client_fd = client_fd;
                 clients[i]->lastReceived = time(NULL);
                 found = 1; break;
@@ -71,8 +73,7 @@ int main(int argc, char *argv[]) {
             if (handleClient(clients[i])) {
                 printf("CLOSED:    fd=%2d\n", clients[i]->client_fd);
                 if (clients[i]->header) freeHttpReqHeader(clients[i]->header);
-                close(clients[i]->client_fd);
-                free(clients[i]);
+                close(clients[i]->client_fd); free(clients[i]);
                 clients[i] = NULL;
             }
         }
@@ -81,12 +82,12 @@ int main(int argc, char *argv[]) {
     close(socket_fd); // never occurs anyways
 }
 
-void tryOrDie(int iserror, const char *errorOutput) {
-    if (iserror) printf("%s", errorOutput), exit(EXIT_FAILURE);
+void tryOrDie(int iserror, const char *text) {
+    if (iserror) printf("%s%s\n", text, strerror(errno)), exit(EXIT_FAILURE);
 }
 int initServer(unsigned short port) {
-    int socket_fd = socket(PF_INET /* IPv4 */, SOCK_STREAM /* TCP */, 0 /* default protocol */);
-    tryOrDie(socket_fd < 0, "Failed to create socket...\n");
+    int socket_fd = socket(PF_INET /* IPv4 */, SOCK_STREAM /* TCP */, 0 /* default protocol */);    
+    tryOrDie(socket_fd < 0, "Failed to create socket: ");
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -94,17 +95,17 @@ int initServer(unsigned short port) {
     addr.sin_port = htons(port);              // HTTP is 80
     addr.sin_addr.s_addr = htonl(INADDR_ANY); // any local IP
     int status = bind(socket_fd, (struct sockaddr *)&addr, sizeof(addr));
-    tryOrDie(status < 0, "Failed to bind socket...\n");
+    tryOrDie(status < 0, "Failed to bind socket: ");
 
-    int queueLimit = 10;
-    status = listen(socket_fd, queueLimit);
-    tryOrDie(status < 0, "Failed to listen on port...\n");    
+    status = listen(socket_fd, QUEUE_SIZE);
+    tryOrDie(status < 0, "Failed to listen: ");    
     return socket_fd;
 }
 char handleClient(struct client_connection *c) {
-    ssize_t count = recv(c->client_fd, c->buffer + c->size, BUFFER_SIZE, 0);
+    ssize_t count = recv(c->client_fd, c->buffer + c->size, BUFFER_SIZE - c->size, 0);
     if (count <= 0) return difftime(time(NULL), c->lastReceived) > TIMEOUT_SECS;
     c->size += count; c->buffer[c->size] = 0; c->lastReceived = time(NULL);
+    if (c->size >= BUFFER_SIZE) return 1; // maximum allowed length
     if (c->header == NULL) {
         size_t contentIndex = 0, i;
         for (i = 0; i + 3 < c->size; i++)
@@ -115,12 +116,12 @@ char handleClient(struct client_connection *c) {
             struct key_value *contentLength = getField(c->header, "Content-Length");
             if (contentLength) {
                 c->expectedsize = contentIndex + atoi(contentLength->value);
-                if ((c->expectedsize = contentIndex + atoi(contentLength->value)) > BUFFER_SIZE)
+                if ((c->expectedsize = contentIndex + atoi(contentLength->value)) > MESSAGE_MAX_SIZE)
                     return 1; // maximum allowed length
             } else c->expectedsize = c->size;
-        }
+        } else if (contentIndex) return 1; // unable to parse header...
     }
-    if (c->size >= c->expectedsize) {
+    if (c->expectedsize && c->size >= c->expectedsize) {
         printf("REQUEST:   fd=%2d    %s\n", c->client_fd, c->header->uri);
         const char *hostip = doLookup(c->header->uriHost, c->header->uriPort),
             *contentTemplate = "<!doctype html><html><body>"
@@ -141,7 +142,8 @@ char handleClient(struct client_connection *c) {
         struct key_value *connection = getField(c->header, "Connection");
         char keepalive = strcasecmp(c->header->httpVersion, "HTTP/1.1") == 0 || // HTTP/1.1 keep alive by default
                          (connection && strcasecmp(connection->value, "keep-alive") == 0);
-        return c->header = NULL, !keepalive;
+        freeHttpReqHeader(c->header); c->header = NULL;
+        return !keepalive;
     } return 0; // keep alive until all data is received
 }
 struct key_value *getField(struct http_request_header *reqheader, const char *fieldName) {
